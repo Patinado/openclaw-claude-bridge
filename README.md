@@ -114,6 +114,32 @@ The bridge supports Claude's extended thinking via the `reasoning_effort` parame
 
 When `reasoning_effort` is not provided, thinking is disabled entirely (`MAX_THINKING_TOKENS=0`).
 
+### Idle Disconnect Protection (Heartbeat)
+
+When Claude is thinking for a long time (common with Opus + extended thinking), the SSE stream may go silent for minutes. Many OpenAI-compatible clients and stream wrappers have idle timeouts that will abort the connection if no data arrives.
+
+The bridge sends periodic **heartbeat events** every 15 seconds during silent thinking periods. These are valid SSE data chunks with an empty `choices` array:
+
+```json
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"...","choices":[]}
+```
+
+This format is intentional: plain SSE comments (`: keepalive`) are silently discarded by the OpenAI SDK's SSE parser and do not reset idle timers in stream consumers. Empty-choices data chunks pass through the SDK iterator, reset idle timers, but are harmlessly skipped by the response parser (no choice = nothing to process).
+
+### Per-Channel Request Serialization
+
+Each conversation channel (identified by OC's conversation label + agent name) is serialized: only one request at a time can be in-flight per channel. Subsequent requests for the same channel wait in a queue until the previous request completes.
+
+This prevents a class of race conditions where concurrent requests could create multiple CLI sessions for the same channel, leading to duplicated sessions and inconsistent conversation state.
+
+Channels are independent — requests to different channels still run in parallel, up to the `MAX_GLOBAL` limit.
+
+### Oversized Prompt Guards
+
+If a prompt exceeds 600,000 characters (~150K tokens), the bridge automatically compacts it using truncated conversation history before sending to Claude CLI. This prevents context overflow errors and retry loops that could otherwise occur when OpenClaw sends a compacted conversation that still exceeds the model's context window.
+
+The guard applies to all new-session paths, including compact retry after CLI failure.
+
 ---
 
 ## Dashboard
@@ -151,11 +177,11 @@ For detailed architecture of the dashboard, see [docs/architecture.md](docs/arch
 | `SONNET_MODEL` | No | `sonnet` | CLI model alias for Sonnet (use `sonnet[1m]` for 1M context) |
 | `HAIKU_MODEL` | No | `haiku` | CLI model alias for Haiku |
 | `IDLE_TIMEOUT_MS` | No | `120000` | Kill CLI subprocess after this many ms of no output |
+| `MAX_GLOBAL` | No | `20` | Max concurrent requests globally |
+| `TOOL_PROFILE_MODE` | No | `off` | Tool filtering: `off` = all tools, `auto` = core tools + conversation-referenced tools (experimental) |
 | `OPENCLAW_BRIDGE_PORT` | No | `3456` | API server port |
 | `OPENCLAW_BRIDGE_STATUS_PORT` | No | `3458` | Dashboard port |
 | `CLAUDE_BIN` | No | `claude` | Path to Claude Code CLI binary |
-| `MAX_PER_CHANNEL` | No | `2` | Max concurrent requests per channel |
-| `MAX_GLOBAL` | No | `20` | Max concurrent requests globally |
 
 ### Ports
 
@@ -266,7 +292,7 @@ openclaw-claude-bridge/
 │   ├── index.js         Entry point, HTTP servers, graceful shutdown
 │   ├── server.js        Request handling, session management, state persistence
 │   ├── claude.js        CLI subprocess, stream parsing, thinking/effort mapping
-│   ├── tools.js         Dynamic tool protocol builder
+│   ├── tools.js         Dynamic tool protocol builder, profile filtering
 │   └── convert.js       OpenAI message format → Claude CLI text format
 ├── dashboard/           React/TypeScript/Tailwind dashboard (Vite)
 │   ├── src/             Components, hooks, lib, types
@@ -277,10 +303,66 @@ openclaw-claude-bridge/
 │   ├── com.openclaw.claude-bridge.plist   macOS launchd agent (template)
 │   └── install-mac.sh                    macOS one-line installer
 ├── docs/                Technical documentation
+├── test-smoke.sh        Operational smoke tests
 ├── .env.example         Environment variable template
 ├── state.json           Runtime state (auto-generated, gitignored)
 └── package.json
 ```
+
+---
+
+## Diagnostics
+
+The bridge captures detailed telemetry for every request, visible in the dashboard and `/status` endpoint.
+
+**Error accounting** — All error paths now increment the error counter, including client disconnects (`oc_disconnect`), CLI exit codes (`cli_exit`), idle/hard timeouts, and failed retries. The dashboard `errors` count reflects real failures, not just unhandled exceptions.
+
+**Error classification** — Each failed request is tagged with a specific status: `oc_disconnect` (client closed connection), `cli_exit` (Claude CLI exited with non-zero code), `idle_timeout`, `hard_timeout`, or generic `error`. This helps distinguish infrastructure issues from model errors.
+
+**stderr capture** — When Claude CLI exits with a non-zero code, the last 5 lines of stderr are included in the error message and visible in the dashboard. This surfaces the actual CLI error (e.g., auth failures, context overflow) without needing to check system logs.
+
+**Usage availability** — Each log entry includes a `usageAvailable` flag that distinguishes "Claude returned zero tokens" (real) from "no usage data was received" (CLI exited before reporting). This prevents misleading zero-cost entries in the dashboard.
+
+---
+
+## Smoke Tests
+
+The included `test-smoke.sh` script performs basic operational verification:
+
+```bash
+bash test-smoke.sh          # default port 3456
+bash test-smoke.sh 3456     # explicit port
+```
+
+Tests include:
+- Health endpoint responds
+- Models endpoint returns expected models
+- SSE heartbeat chunks arrive during streaming
+- Memflush interception returns `NO_REPLY`
+- Status endpoint is reachable
+
+The script does not require Claude CLI to be logged in for all tests — the heartbeat test will attempt a real CLI request.
+
+---
+
+## Tool Profile Filtering (Experimental)
+
+By default, the bridge passes all tools from OpenClaw's request to the system prompt. For agents with many registered tools (20+), this adds overhead to every request.
+
+Setting `TOOL_PROFILE_MODE=auto` enables profile-based filtering: only a core set of frequently-used tools (`exec`, `process`, `read`, `edit`, `write`, `message`, `memory_search`, `web_search`) plus any tools already referenced in the conversation history are included. Other tools are omitted from the system prompt.
+
+This is **disabled by default** (`TOOL_PROFILE_MODE=off`). When enabled, the bridge logs which tools were kept and which were dropped for each request.
+
+**Caution:** If an agent needs a tool that isn't in the core set and hasn't appeared in conversation history, it won't be available on that turn. Enable this only after reviewing your agents' actual tool usage patterns.
+
+---
+
+## Known Limitations
+
+- **Heartbeat format depends on stream consumer behavior.** The empty-choices heartbeat works with the OpenAI SDK and OpenClaw's pi-ai streaming layer. Other consumers that reject chunks with no choices may need adjustment.
+- **Tool profile filtering is experimental.** The core tool set is hardcoded; there is no per-agent or per-channel configuration yet.
+- **Idle timeout tuning depends on OpenClaw configuration.** For best results, set `agents.defaults.llm.idleTimeoutSeconds` in OpenClaw's config to a value higher than the bridge's heartbeat interval (15s). The default OpenClaw idle timeout (60s) will cause disconnects if heartbeats are not enabled.
+- **Session serialization is per routing key.** Requests without an extractable conversation label (missing OC metadata) are not serialized and may create parallel sessions.
 
 ---
 
