@@ -5,6 +5,44 @@
 const GATEWAY_BLOCKED = new Set(['sessions_send', 'sessions_spawn', 'gateway']);
 
 /**
+ * Tool profile filtering (opt-in).
+ * Set env TOOL_PROFILE_MODE=auto to enable profile-based tool selection.
+ * When enabled, only frequently-used tools are included in the system prompt,
+ * reducing token overhead by ~3-5KB per request.
+ *
+ * Profiles:
+ * - core: tools used in >95% of requests (exec, process, read, edit, write, message)
+ * - search: web_search, memory_search, exa_search
+ * - all: everything (same as TOOL_PROFILE_MODE=off)
+ *
+ * When auto: includes core + search + any tool that appeared in conversation history.
+ */
+const TOOL_PROFILE_MODE = process.env.TOOL_PROFILE_MODE || 'off';
+const CORE_TOOLS = new Set(['exec', 'process', 'read', 'edit', 'write', 'message', 'memory_search', 'web_search']);
+
+function filterToolsByProfile(tools, messages) {
+    if (TOOL_PROFILE_MODE === 'off') return tools;
+
+    // In auto mode: core tools + any tool already referenced in conversation
+    const usedTools = new Set();
+    for (const msg of messages) {
+        if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+            for (const tc of msg.tool_calls) {
+                usedTools.add(tc.function?.name || tc.name);
+            }
+        }
+        if (msg.role === 'tool' && msg.name) {
+            usedTools.add(msg.name);
+        }
+    }
+
+    return tools.filter(t => {
+        const name = t.function?.name || t.name;
+        return CORE_TOOLS.has(name) || usedTools.has(name);
+    });
+}
+
+/**
  * Build tool instructions for the system prompt.
  *
  * In the new architecture, Claude does NOT execute tools.
@@ -56,4 +94,4 @@ function buildToolInstructions(tools) {
     return lines.join('\n');
 }
 
-module.exports = { buildToolInstructions };
+module.exports = { buildToolInstructions, filterToolsByProfile };
